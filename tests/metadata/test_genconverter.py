@@ -7,7 +7,8 @@ from attr import fields, make_class
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis.strategies import sampled_from
 
-from cattr import Converter, UnstructureStrategy
+from cattr import GenConverter as Converter
+from cattr import UnstructureStrategy
 
 from . import nested_typed_classes, simple_typed_attrs, simple_typed_classes
 

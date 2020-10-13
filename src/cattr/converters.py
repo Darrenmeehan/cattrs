@@ -12,21 +12,22 @@ from typing import (  # noqa: F401, imported for Mypy.
     Type,
     TypeVar,
 )
+
 from ._compat import (
-    bytes,
+    get_origin,
     is_bare,
     is_frozenset,
+    is_generic,
     is_mapping,
     is_mutable_set,
     is_sequence,
     is_tuple,
     is_union_type,
     lru_cache,
-    unicode,
 )
 from .disambiguators import create_uniq_field_dis_func
+from .gen import make_dict_structure_fn, make_dict_unstructure_fn
 from .multistrategy_dispatch import MultiStrategyDispatch
-
 
 NoneType = type(None)
 T = TypeVar("T")
@@ -83,7 +84,7 @@ class Converter(object):
         self._unstructure_func.register_cls_list(
             [
                 (bytes, self._unstructure_identity),
-                (unicode, self._unstructure_identity),
+                (str, self._unstructure_identity),
             ]
         )
         self._unstructure_func.register_func_list(
@@ -115,7 +116,10 @@ class Converter(object):
         # Strings are sequences.
         self._structure_func.register_cls_list(
             [
-                (unicode, self._structure_call,),
+                (
+                    str,
+                    self._structure_call,
+                ),
                 (bytes, self._structure_call),
                 (int, self._structure_call),
                 (float, self._structure_call),
@@ -239,8 +243,14 @@ class Converter(object):
         Bare optionals end here too (optionals with arguments are unions.) We
         treat bare optionals as Any.
         """
-        if cl is Any or cl is Optional:
+        if cl is Any or cl is Optional or cl is None:
             return obj
+
+        if is_generic(cl):
+            fn = make_dict_structure_fn(cl, self)
+            self.register_structure_hook(cl, fn)
+            return fn(obj)
+
         # We don't know what this is, so we complain loudly.
         msg = (
             "Unsupported type: {0}. Register a structure hook for "
@@ -259,7 +269,7 @@ class Converter(object):
 
     def _structure_unicode(self, obj, cl):
         """Just call ``cl`` with the given ``obj``"""
-        if not isinstance(obj, (bytes, unicode)):
+        if not isinstance(obj, (bytes, str)):
             return cl(str(obj))
         else:
             return obj
@@ -289,6 +299,7 @@ class Converter(object):
         # type: (Mapping[str, Any], Type[T]) -> T
         """Instantiate an attrs class from a mapping (dict)."""
         # For public use.
+
         conv_obj = {}  # Start with a fresh dict, to ignore extra keys.
         dispatch = self._structure_func.dispatch
         for a in cl.__attrs_attrs__:  # type: ignore
@@ -391,9 +402,12 @@ class Converter(object):
         cl = self._dis_func_cache(union)(obj)
         return self._structure_func.dispatch(cl)(obj, cl)
 
-    def _structure_tuple(self, obj, tup):
+    def _structure_tuple(self, obj, tup: Type[T]):
         """Deal with converting to a tuple."""
-        tup_params = tup.__args__
+        if tup in (Tuple, tuple):
+            tup_params = None
+        else:
+            tup_params = tup.__args__
         has_ellipsis = tup_params and tup_params[-1] is Ellipsis
         if tup_params is None or (has_ellipsis and tup_params[0] is Any):
             # Just a Tuple. (No generic information.)
@@ -421,9 +435,42 @@ class Converter(object):
                 e for e in union_types if e is not NoneType  # type: ignore
             )
 
-        if not all(hasattr(e, "__attrs_attrs__") for e in union_types):
+        if not all(
+            hasattr(get_origin(e) or e, "__attrs_attrs__") for e in union_types
+        ):
             raise ValueError(
                 "Only unions of attr classes supported "
                 "currently. Register a loads hook manually."
             )
         return create_uniq_field_dis_func(*union_types)
+
+
+class GenConverter(Converter):
+    """A converter which generates specialized un/structuring functions."""
+
+    __slots__ = "omit_if_default"
+
+    def __init__(
+        self,
+        dict_factory=dict,
+        unstruct_strat=UnstructureStrategy.AS_DICT,
+        omit_if_default=False,
+    ):
+        super().__init__(
+            dict_factory=dict_factory, unstruct_strat=unstruct_strat
+        )
+        self.omit_if_default = omit_if_default
+
+    def unstructure_attrs_asdict(self, obj: Any) -> Dict[str, Any]:
+        h = make_dict_unstructure_fn(
+            obj.__class__, self, omit_if_default=self.omit_if_default
+        )
+        self.register_unstructure_hook(obj.__class__, h)
+        return h(obj)
+
+    def structure_attrs_fromdict(
+        self, obj: Mapping[str, Any], cl: Type[T]
+    ) -> T:
+        h = make_dict_structure_fn(cl, self)
+        self.register_structure_hook(cl, h)
+        return h(obj, cl)
